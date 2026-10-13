@@ -1,0 +1,410 @@
+"use client";
+
+import { useEffect, useMemo, useState } from "react";
+import {
+  getBgCheckQueue,
+  decideBgCheck,
+  getDecisionTrail,
+  BG_CHECK_DECISIONS,
+  BG_DECISION,
+  isBgCheckPending,
+  type BgCheckQueueRow,
+  type BgCheckDecision,
+  type DecisionTrailRow,
+} from "@/lib/queries";
+import {
+  PageHeader,
+  DataTable,
+  Column,
+  StatusBadge,
+  FilterBar,
+  Button,
+  Modal,
+  FormField,
+  ErrorBanner,
+  inputClass,
+  selectClass,
+} from "@/components/ui";
+import { formatDate } from "@/lib/utils";
+import { ShieldCheck, FileText, Car, Receipt, Camera } from "lucide-react";
+
+/**
+ * Staff-facing review queue.
+ *
+ * The background_checks table is admin-only at the database level. Everything
+ * here comes from the bg_check_queue RPC, which returns masked contact details
+ * and presence flags instead of the raw licence, insurance and paystub files.
+ * Decisions go back through bg_check_decide, which writes the verdict and, since
+ * S3-03, one append-only row in decision_events (decideBgCheck supplies the
+ * idempotency key). No reason code is sent from here: the reason vocabulary is
+ * owner policy (S3-05) and does not exist yet, so the picker is not built.
+ */
+
+/**
+ * The decision buttons, in the order staff see them. The values come from
+ * BG_DECISION so the wire string is spelled out in exactly one place; only the
+ * button copy is local. "Pass" is the primary action, the rest are secondary.
+ */
+const DECISION_BUTTONS: ReadonlyArray<{ decision: BgCheckDecision; label: string; primary?: boolean }> = [
+  { decision: BG_DECISION.eligible, label: "Pass — Eligible", primary: true },
+  { decision: BG_DECISION.notEligible, label: "Fail — Not Eligible" },
+  { decision: BG_DECISION.needsReview, label: "Escalate to manager" },
+  { decision: BG_DECISION.outOfRadius, label: "Out of radius" },
+  { decision: BG_DECISION.notFound, label: "Not found" },
+];
+
+function DocPill({ ok, label, icon }: { ok: boolean | null; label: string; icon: React.ReactNode }) {
+  return (
+    <span
+      title={ok ? `${label} on file` : `${label} missing`}
+      className={
+        "inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-xs " +
+        (ok
+          ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
+          : "bg-gray-100 text-gray-400 dark:bg-slate-800 dark:text-slate-500")
+      }
+    >
+      {icon}
+      <span className="sr-only">{ok ? `${label} on file` : `${label} missing`}</span>
+    </span>
+  );
+}
+
+export default function StaffReviewQueue() {
+  const [rows, setRows] = useState<BgCheckQueueRow[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("");
+
+  const [active, setActive] = useState<BgCheckQueueRow | null>(null);
+  const [notes, setNotes] = useState("");
+  const [saving, setSaving] = useState<BgCheckDecision | null>(null);
+
+  // S3-06: the decision trail for the check being reviewed. Loaded when the
+  // modal opens; a failure here must not block the decision itself, so it has
+  // its own error slot instead of the page-level one.
+  const [trail, setTrail] = useState<DecisionTrailRow[] | null>(null);
+  const [trailError, setTrailError] = useState<string | null>(null);
+
+  // Called from event handlers (after a decision is saved).
+  const load = () => {
+    setLoading(true);
+    setError(null);
+    return getBgCheckQueue()
+      .then((d) => {
+        setRows(d);
+        setLoading(false);
+      })
+      .catch((e: Error) => {
+        setError(e.message || "Could not load the review queue.");
+        setLoading(false);
+      });
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    getBgCheckQueue()
+      .then((d) => {
+        if (cancelled) return;
+        setRows(d);
+        setLoading(false);
+      })
+      .catch((e: Error) => {
+        if (cancelled) return;
+        setError(e.message || "Could not load the review queue.");
+        setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const filtered = useMemo(
+    () =>
+      rows.filter((r) => {
+        const q = search.trim().toLowerCase();
+        const matchSearch =
+          !q ||
+          [r.customer_name, r.email_masked, r.phone_last4]
+            .filter(Boolean)
+            .some((v) => String(v).toLowerCase().includes(q));
+        const matchStatus = !statusFilter || r.eligibility_status === statusFilter;
+        return matchSearch && matchStatus;
+      }),
+    [rows, search, statusFilter]
+  );
+
+  const pending = useMemo(
+    () => rows.filter((r) => isBgCheckPending(r.eligibility_status)).length,
+    [rows]
+  );
+
+  const columns: Column<BgCheckQueueRow>[] = [
+    {
+      key: "customer_name",
+      label: "Customer",
+      render: (r) => (
+        <div>
+          <p className="font-medium text-gray-900 dark:text-white">{r.customer_name || "—"}</p>
+          <p className="text-xs text-gray-500 dark:text-slate-400">
+            {r.email_masked || "no email"}
+            {r.phone_last4 ? ` · ••••${r.phone_last4}` : ""}
+          </p>
+        </div>
+      ),
+    },
+    {
+      key: "has_license",
+      label: "Documents",
+      render: (r) => (
+        <div className="flex items-center gap-1">
+          <DocPill ok={r.has_license} label="Licence" icon={<Car size={13} />} />
+          <DocPill ok={r.has_insurance_proof} label="Insurance" icon={<FileText size={13} />} />
+          <DocPill ok={r.has_paystub} label="Paystub" icon={<Receipt size={13} />} />
+          <DocPill ok={r.has_screenshot} label="Check screenshot" icon={<Camera size={13} />} />
+        </div>
+      ),
+    },
+    {
+      key: "eligibility_status",
+      label: "Decision",
+      render: (r) =>
+        r.eligibility_status ? <StatusBadge status={r.eligibility_status} /> : (
+          <span className="text-xs text-amber-600 dark:text-amber-400">Awaiting review</span>
+        ),
+    },
+    {
+      key: "created_at",
+      label: "Submitted",
+      render: (r) => <span className="text-sm">{formatDate(r.created_at as string)}</span>,
+    },
+    {
+      key: "reviewed_at",
+      label: "Reviewed",
+      render: (r) => (
+        <span className="text-sm text-gray-500 dark:text-slate-400">
+          {r.reviewed_at ? formatDate(r.reviewed_at) : "—"}
+        </span>
+      ),
+    },
+  ];
+
+  const openReview = (r: BgCheckQueueRow) => {
+    setActive(r);
+    setNotes(r.review_notes ?? "");
+    setError(null);
+    setTrail(null);
+    setTrailError(null);
+    getDecisionTrail(r.id)
+      .then(setTrail)
+      .catch((e: Error) => setTrailError(e.message || "Could not load the decision history."));
+  };
+
+  const submit = async (decision: BgCheckDecision) => {
+    if (!active) return;
+    setSaving(decision);
+    setError(null);
+    try {
+      await decideBgCheck(active.id, decision, notes);
+      setActive(null);
+      setSaving(null);
+      load();
+    } catch (e) {
+      setError((e as Error).message || "Could not save that decision.");
+      setSaving(null);
+    }
+  };
+
+  return (
+    <div>
+      <PageHeader
+        title="Background Check Review"
+        description={
+          pending > 0
+            ? `${pending} awaiting review · ${rows.length} total`
+            : `${rows.length} total checks`
+        }
+      />
+
+      <div className="mb-4 flex items-start gap-2 rounded border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-900 dark:border-blue-900 dark:bg-blue-950 dark:text-blue-200">
+        <ShieldCheck size={16} className="mt-0.5 shrink-0" />
+        <p>
+          Contact details are masked and documents are shown as on-file or missing. Full records are
+          restricted to admins.
+        </p>
+      </div>
+
+      <FilterBar
+        search={search}
+        onSearchChange={setSearch}
+        placeholder="Search by name or masked contact..."
+      >
+        <select
+          className={selectClass + " sm:w-56"}
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value)}
+        >
+          <option value="">All decisions</option>
+          {BG_CHECK_DECISIONS.map((s) => (
+            <option key={s} value={s}>
+              {s}
+            </option>
+          ))}
+        </select>
+      </FilterBar>
+
+      <ErrorBanner message={!active ? error : null} onDismiss={() => setError(null)} />
+
+      {loading ? (
+        <div className="flex justify-center py-12">
+          <div className="h-8 w-8 animate-spin rounded-full border-b-2 border-blue-600" />
+        </div>
+      ) : (
+        <DataTable columns={columns} data={filtered} onRowClick={openReview} />
+      )}
+
+      <Modal
+        open={!!active}
+        onClose={() => {
+          setActive(null);
+          setError(null);
+          setSaving(null);
+        }}
+        title={active?.customer_name ? `Review — ${active.customer_name}` : "Review"}
+        wide
+      >
+        {active && (
+          <div className="grid grid-cols-1 gap-4">
+            <ErrorBanner message={error} onDismiss={() => setError(null)} />
+
+            <div className="grid grid-cols-2 gap-3 text-sm sm:grid-cols-4">
+              <div>
+                <p className="text-xs text-gray-500 dark:text-slate-400">Email</p>
+                <p className="font-medium">{active.email_masked || "—"}</p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-500 dark:text-slate-400">Phone</p>
+                <p className="font-medium">{active.phone_last4 ? `••••${active.phone_last4}` : "—"}</p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-500 dark:text-slate-400">Submitted</p>
+                <p className="font-medium">{formatDate(active.created_at as string)}</p>
+              </div>
+              <div>
+                <p className="text-xs text-gray-500 dark:text-slate-400">Form submitted</p>
+                <p className="font-medium">{active.verification_form_submitted ? "Yes" : "No"}</p>
+              </div>
+            </div>
+
+            <div>
+              <p className="mb-1 text-xs text-gray-500 dark:text-slate-400">Documents on file</p>
+              <div className="flex flex-wrap gap-2 text-sm">
+                {[
+                  ["Licence", active.has_license],
+                  ["Proof of insurance", active.has_insurance_proof],
+                  ["Paystub", active.has_paystub],
+                  ["Check screenshot", active.has_screenshot],
+                ].map(([label, ok]) => (
+                  <span
+                    key={String(label)}
+                    className={
+                      "rounded px-2 py-1 " +
+                      (ok
+                        ? "bg-emerald-50 text-emerald-700 dark:bg-emerald-950 dark:text-emerald-300"
+                        : "bg-gray-100 text-gray-500 dark:bg-slate-800 dark:text-slate-400")
+                    }
+                  >
+                    {ok ? "✓" : "—"} {String(label)}
+                  </span>
+                ))}
+              </div>
+            </div>
+
+            {active.key_details && (
+              <div>
+                <p className="mb-1 text-xs text-gray-500 dark:text-slate-400">
+                  Key details from the check
+                </p>
+                <p className="whitespace-pre-wrap rounded bg-gray-50 p-3 text-sm dark:bg-slate-800">
+                  {active.key_details}
+                </p>
+              </div>
+            )}
+
+            <div>
+              <p className="mb-1 text-xs text-gray-500 dark:text-slate-400">Decision history</p>
+              {trailError ? (
+                <p className="text-sm text-amber-700 dark:text-amber-300">{trailError}</p>
+              ) : trail === null ? (
+                <p className="text-sm text-gray-400 dark:text-slate-500">Loading…</p>
+              ) : trail.length === 0 ? (
+                <p className="text-sm text-gray-500 dark:text-slate-400">
+                  No decision recorded yet
+                  {active.eligibility_status ? " (the current verdict predates the decision trail)" : ""}.
+                </p>
+              ) : (
+                <ol className="divide-y divide-gray-100 rounded border border-gray-200 text-sm dark:divide-slate-800 dark:border-slate-700">
+                  {trail.map((t) => (
+                    <li key={t.decision_event_id} className="flex flex-wrap items-start gap-x-3 gap-y-1 px-3 py-2">
+                      <span className="w-36 shrink-0 text-xs text-gray-500 dark:text-slate-400">
+                        {formatDate(t.created_at)}
+                      </span>
+                      <span className="flex items-center gap-1">
+                        {t.previous_decision && (
+                          <span className="text-xs text-gray-400 dark:text-slate-500">{t.previous_decision} →</span>
+                        )}
+                        <StatusBadge status={t.decision} />
+                      </span>
+                      <span className="text-xs text-gray-500 dark:text-slate-400">
+                        {t.actor_kind} · {t.source}
+                        {t.reason_code ? ` · ${t.reason_code}` : ""}
+                        {t.reason_category ? ` (${t.reason_category})` : ""}
+                        {t.next_destination ? ` · → ${t.next_destination}` : ""}
+                      </span>
+                      {t.explanation && (
+                        <span className="basis-full whitespace-pre-wrap text-gray-700 dark:text-slate-300">
+                          {t.explanation}
+                        </span>
+                      )}
+                    </li>
+                  ))}
+                </ol>
+              )}
+            </div>
+
+            <FormField label="Review notes">
+              <textarea
+                rows={3}
+                value={notes}
+                onChange={(e) => setNotes(e.target.value)}
+                maxLength={4000}
+                className={inputClass}
+                placeholder="What you saw, and why you decided this way."
+              />
+            </FormField>
+
+            <div>
+              <p className="mb-2 text-xs text-gray-500 dark:text-slate-400">
+                Record a decision
+                {active.eligibility_status ? ` · currently “${active.eligibility_status}”` : ""}
+              </p>
+              <div className="flex flex-wrap gap-2">
+                {DECISION_BUTTONS.map(({ decision, label, primary }) => (
+                  <Button
+                    key={decision}
+                    variant={primary ? "primary" : "secondary"}
+                    onClick={() => submit(decision)}
+                    disabled={!!saving}
+                  >
+                    {saving === decision ? "Saving..." : label}
+                  </Button>
+                ))}
+              </div>
+            </div>
+          </div>
+        )}
+      </Modal>
+    </div>
+  );
+}

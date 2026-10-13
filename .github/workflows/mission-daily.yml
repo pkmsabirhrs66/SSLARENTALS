@@ -1,0 +1,50 @@
+name: mission-daily
+
+# Free Vercel-Pro-cron replacement: hits /api/mission/generate once a day
+# so the owner + every teammate with a telegram_chat_id receives their
+# daily Mission Control summary on Telegram.
+#
+# Setup (one-time):
+#   1. gh secret set CRON_SECRET --body "$CRON_SECRET" --repo AIXMOS537/TMMT
+#      (use the same value that's set in Vercel for tmmt-ops)
+#   2. Optional: gh secret set MISSION_API_BASE --body "https://tmmt-ops.vercel.app"
+#      Defaults to https://tmmt-ops.vercel.app if not set.
+#
+# Triggers:
+#   - schedule: daily at 13:00 UTC (8 AM EST / 9 AM EDT)
+#   - workflow_dispatch: manual fire-now button in the Actions tab
+
+on:
+  schedule:
+    - cron: "0 13 * * *"
+  workflow_dispatch:
+    inputs:
+      audience:
+        description: "owner (just owner chat) or team (every profile with a chat_id)"
+        required: true
+        default: team
+        type: choice
+        options: [owner, team]
+      notify:
+        description: "Actually send to Telegram? false = dry-run preview only"
+        required: true
+        default: "true"
+
+jobs:
+  push-mission:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: scripts/mission-call.sh
+          sparse-checkout-cone-mode: false
+      # PASS only when the mission was built (and sent, when notify=true).
+      # A redirect, login page, 401/403, 5xx or ok!=true fails the job.
+      # Auth is Authorization: Bearer (the only header the edge accepts).
+      - name: POST /api/mission/generate
+        env:
+          CRON_SECRET: ${{ secrets.CRON_SECRET }}
+          MISSION_API_BASE: ${{ secrets.MISSION_API_BASE || 'https://tmmt-ops.vercel.app' }}
+          AUDIENCE: ${{ github.event.inputs.audience || 'team' }}
+          NOTIFY: ${{ github.event.inputs.notify || 'true' }}
+        run: bash scripts/mission-call.sh

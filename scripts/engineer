@@ -1,0 +1,161 @@
+#!/usr/bin/env bash
+# engineer — the systems-engineer console. Run an operator's machine (e.g. an
+# Legacy's) from YOUR carry M5, over your private Tailscale mesh. Owner-only.
+#
+# Access is consented + least-privilege: the operator's node must be on your
+# tailnet with Tailscale SSH on (they approved your device). Nothing covert.
+#
+#   engineer add <name> <user@host>     register an operator node you manage
+#   engineer roster                     list managed nodes + reachability
+#   engineer status <name>              reachable? their repo HEAD + quick health
+#   engineer pull <name> <remote-path>  intake their work over the mesh
+#   engineer run <name> "<command>"     run a command on their node (SSH)
+#   engineer sync <name>                update their repo (git pull master)
+#   engineer fix <name>                 run the readiness+security doctor there
+#   engineer setup <name>               ensure repo + run operator setup there
+set -uo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd 2>/dev/null || echo "$PWD")"
+REG="$ROOT/.hailmary/operators"      # gitignored registry of managed nodes
+if [[ -t 1 ]]; then G=$'\e[32m'; Y=$'\e[33m'; R=$'\e[31m'; C=$'\e[36m'; W=$'\e[97m'; D=$'\e[2m'; BD=$'\e[1m'; X=$'\e[0m'; else G=; Y=; R=; C=; W=; D=; BD=; X=; fi
+ok(){ printf '%s  ✓ %s%s\n' "$G" "$*" "$X"; }
+warn(){ printf '%s  ! %s%s\n' "$Y" "$*" "$X" >&2; }
+say(){ printf '%s\n' "$*"; }
+die(){ printf '  ✗ %s\n' "$*" >&2; exit 1; }
+slug(){ printf '%s' "$1" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9-'; }
+
+# DARK kill-switch: no remote ops while blacked out (roster/status read-only ok).
+if [ -f "$ROOT/.swarm/DARK" ]; then
+  case "${1:-}" in roster|status|""|"?") : ;;
+    *) die "⛔ DARK — remote ops paused. Lift: bash scripts/godark lift";; esac
+fi
+
+SSH="ssh -o ConnectTimeout=8 -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
+# Find the repo on the remote, run a command inside it.
+RLOC='d=""; for p in ~/projects/TMMT ~/Projects/TMMT ~/TMMT ~/TMMT-OPS; do [ -d "$p/.git" ] && { d="$p"; break; }; done; echo "$d"'
+
+# Tailscale CLI, wherever it lives (PATH or the Mac app bundle).
+TS(){ if command -v tailscale >/dev/null 2>&1; then tailscale "$@"; elif [ -x /Applications/Tailscale.app/Contents/MacOS/Tailscale ]; then /Applications/Tailscale.app/Contents/MacOS/Tailscale "$@"; else return 127; fi; }
+
+# Show every machine on your tailnet, let you pick one, return user@host on stdout.
+# Menu + prompts go to /dev/tty so only the chosen "user@host" is captured.
+_pick_node(){
+  local json; json="$(TS status --json 2>/dev/null)" || { warn "Tailscale not found/running — start it or pass user@host manually"; return 1; }
+  [ -n "$json" ] || { warn "Tailscale not reachable"; return 1; }
+  printf '%s' "$json" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+users=d.get("User",{}) or {}
+peers=d.get("Peer",{}) or {}
+items=[]
+for p in peers.values():
+    h=p.get("HostName","?"); ips=p.get("TailscaleIPs",[]) or ["?"]
+    login=users.get(str(p.get("UserID","")),{}).get("LoginName","")
+    items.append((h, ips[0], login, "online" if p.get("Online") else "offline"))
+items.sort(key=lambda x:(x[3]!="online", x[0]))
+if not items:
+    sys.stderr.write("no-peers"); sys.exit(2)
+tty=open("/dev/tty","w"); inp=open("/dev/tty")
+tty.write("\n  Machines on your tailnet:\n")
+for i,(h,ip,login,on) in enumerate(items,1):
+    tty.write("   %d) %-22s %-22s %s  %s\n"%(i,h,login or "?",ip,on))
+tty.write("  Pick a number: "); tty.flush()
+try: idx=int(inp.readline().strip())-1; h,ip,login,on=items[idx]
+except Exception: sys.stderr.write("bad-choice"); sys.exit(2)
+du=(login.split("@")[0] if login else "")
+tty.write("  Username on %s [%s]: "%(h, du or "type it")); tty.flush()
+u=inp.readline().strip() or du
+if not u: sys.stderr.write("no-user"); sys.exit(2)
+print("%s@%s"%(u,h))
+' 2>/dev/null
+}
+
+_host(){ # echo the user@host for a registered name
+  local f="$REG/$(slug "$1").env"
+  [ -f "$f" ] || die "unknown operator '$1' — add it: engineer add $1 <user@host>"
+  local NAME="" HOST=""
+  # shellcheck disable=SC1090
+  . "$f"; printf '%s' "$HOST"
+}
+
+cmd_add(){
+  local name="${1:-}" host="${2:-}"
+  [ -n "$name" ] || { printf '  Operator / agency name: '; IFS= read -r name || true; }
+  [ -n "$name" ] || die "need a name (e.g. \"Operator One\")"
+  # No host given? Pick it from your tailnet — no typing a hostname.
+  if [ -z "$host" ]; then
+    host="$(_pick_node)" || true
+    [ -n "$host" ] || die "couldn't pick a machine. Make sure Tailscale is running and the
+   operator has shared their node to you. Or pass it directly: engineer add \"$name\" user@host"
+  fi
+  mkdir -p "$REG"
+  { printf 'NAME=%q\n' "$name"; printf 'HOST=%q\n' "$host"; printf 'added_utc=%q\n' "$(date -u +%FT%TZ)"; } > "$REG/$(slug "$name").env"
+  ok "registered '$name' → $host"
+  say "$D   sovereign operator? they SHARE one node to your Tailscale account +$X"
+  say "$D   enable Tailscale SSH on it; you accept the share. (docs/SOVEREIGN-OPERATOR.md)$X"
+  say "   test it:  engineer status $name"
+}
+
+cmd_roster(){
+  [ -d "$REG" ] || { echo "  no operators yet. add one: engineer add <name> <user@host>"; exit 0; }
+  printf '\n%s   MANAGED OPERATORS%s\n\n' "$C$BD" "$X"
+  local f; for f in "$REG"/*.env; do [ -f "$f" ] || continue
+    # shellcheck disable=SC1090
+    ( NAME=""; HOST=""; . "$f"; printf '   • %s%s%s  %s' "$BD" "$NAME" "$X" "$HOST"
+      if $SSH "$HOST" true 2>/dev/null; then printf '   %s● reachable%s\n' "$G" "$X"; else printf '   %s○ offline%s\n' "$D" "$X"; fi )
+  done; echo
+}
+
+cmd_status(){
+  local h; h="$(_host "$1")"
+  printf '\n%s   %s  (%s)%s\n' "$C$BD" "$1" "$h" "$X"
+  if ! $SSH "$h" true 2>/dev/null; then warn "not reachable (on Tailscale? SSH on? device approved?)"; exit 1; fi
+  ok "reachable over the mesh"
+  $SSH "$h" "d=\$($RLOC); [ -n \"\$d\" ] && cd \"\$d\" && echo \"repo: \$d\" && git log --oneline -1 || echo 'repo: (not found)'" 2>/dev/null | sed 's/^/   /'
+  $SSH "$h" "uname -srm; uptime 2>/dev/null | sed 's/^/load:/'" 2>/dev/null | sed 's/^/   /'
+}
+
+cmd_run(){
+  local h; h="$(_host "$1")"; shift
+  local cmd="$*"; [ -n "$cmd" ] || die "usage: engineer run <name> \"<command>\""
+  say "  ${D}[$1] running: $cmd${X}"
+  $SSH "$h" "$cmd"
+}
+
+cmd_sync(){
+  local h; h="$(_host "$1")"
+  say "  updating $1 → latest master…"
+  $SSH "$h" "d=\$($RLOC); [ -n \"\$d\" ] && cd \"\$d\" && git fetch origin && git reset --hard origin/master && echo OK || echo 'no repo'" \
+    && ok "$1 updated" || warn "sync had issues"
+}
+
+cmd_fix(){
+  local h; h="$(_host "$1")"
+  $SSH "$h" "d=\$($RLOC); cd \"\$d\" && bash scripts/swarm-doctor.sh" 2>/dev/null | tail -12 | sed 's/^/   /' \
+    || warn "could not run doctor (repo present? reachable?)"
+}
+
+cmd_setup(){
+  local h; h="$(_host "$1")"
+  say "  provisioning $1 as a fenced operator…"
+  $SSH "$h" "d=\$($RLOC); if [ -z \"\$d\" ]; then git clone https://github.com/AIXMOS537/TMMT.git ~/projects/TMMT && d=~/projects/TMMT; fi; cd \"\$d\" && git fetch origin && git reset --hard origin/master && SWARM_ROLE=operator bash scripts/deploy operator" \
+    && ok "$1 set up (operator)" || warn "setup had issues — check status"
+}
+
+cmd_pull(){
+  local name="$1" path="${2:-}"; local h; h="$(_host "$name")"
+  [ -n "$path" ] || die "usage: engineer pull <name> <remote-path>   (e.g. ~/Desktop/opwork)"
+  exec bash "$ROOT/scripts/intake" mesh "$h:$path" "$name"
+}
+
+case "${1:-roster}" in
+  add)        shift; cmd_add "$@";;
+  discover|find|machines) TS status 2>/dev/null || warn "Tailscale not running";;
+  roster|ls)  cmd_roster;;
+  status)     shift; cmd_status "${1:?name}";;
+  run|exec)   shift; cmd_run "$@";;
+  sync|update) shift; cmd_sync "${1:?name}";;
+  fix|doctor) shift; cmd_fix "${1:?name}";;
+  setup|provision) shift; cmd_setup "${1:?name}";;
+  pull|intake) shift; cmd_pull "$@";;
+  *) echo "engineer: add <name> [picks from Tailscale] | discover | roster | status <name> | pull <name> <path> | run <name> \"cmd\" | sync <name> | fix <name> | setup <name>";;
+esac

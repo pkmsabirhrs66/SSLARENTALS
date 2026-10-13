@@ -1,0 +1,104 @@
+/**
+ * Credit evidence files — validation and storage naming (C2).
+ *
+ * Pure functions (no I/O) so every rule is unit-tested. The upload server action
+ * calls these BEFORE a byte is stored.
+ *
+ * Rules:
+ *   - Allowed: PDF, PNG, JPEG, WebP. Nothing executable, no office macros, no HTML/SVG
+ *     (SVG and HTML can carry script).
+ *   - The type is decided by the file's first bytes (magic number). The browser's
+ *     MIME declaration and the filename extension are NOT trusted; if either
+ *     disagrees with the bytes the upload is refused.
+ *   - Max 10 MB; empty files refused.
+ *   - The stored object name never contains the user's filename:
+ *     `<orgOrNone>/<clientId>/<evidenceId>.<ext from sniffed type>`.
+ *     The original filename is kept only as sanitised display metadata.
+ *   - Nothing uploaded is ever executed, rendered as HTML, or served from a public
+ *     URL: reads go through a short-lived signed URL after an authorization check.
+ */
+
+export const CREDIT_EVIDENCE_BUCKET = "credit-evidence";
+export const MAX_EVIDENCE_BYTES = 10 * 1024 * 1024;
+export const SIGNED_URL_TTL_SECONDS = 120;
+
+export type EvidenceMime = "application/pdf" | "image/png" | "image/jpeg" | "image/webp";
+
+const EXT: Record<EvidenceMime, string> = {
+  "application/pdf": "pdf",
+  "image/png": "png",
+  "image/jpeg": "jpg",
+  "image/webp": "webp",
+};
+
+const EXT_ALIASES: Record<string, EvidenceMime> = {
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  webp: "image/webp",
+};
+
+/** What the bytes actually are. `null` = not an allowed type. */
+export function sniffEvidenceType(bytes: Uint8Array): EvidenceMime | null {
+  const b = bytes;
+  const starts = (sig: number[], at = 0) => sig.every((v, i) => b[at + i] === v);
+  if (b.length >= 5 && starts([0x25, 0x50, 0x44, 0x46, 0x2d])) return "application/pdf"; // %PDF-
+  if (b.length >= 8 && starts([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a])) return "image/png";
+  if (b.length >= 3 && starts([0xff, 0xd8, 0xff])) return "image/jpeg";
+  if (b.length >= 12 && starts([0x52, 0x49, 0x46, 0x46]) && starts([0x57, 0x45, 0x42, 0x50], 8)) return "image/webp"; // RIFF....WEBP
+  return null;
+}
+
+/** C0 control characters and DEL, written as escapes so this source stays plain text. */
+const CONTROL_CHARS = new RegExp("[\\u0000-\\u001f\\u007f]", "g");
+
+/** Display-only filename: no path, no control characters, bounded length. */
+export function safeDisplayName(name: string): string {
+  const base = String(name ?? "").split(/[\\/]/).pop() ?? "";
+  const cleaned = base.replace(CONTROL_CHARS, "").replace(/[^a-zA-Z0-9._ -]/g, "_").trim();
+  return (cleaned || "document").slice(0, 80);
+}
+
+export type FileCheck =
+  | { ok: true; mime: EvidenceMime; ext: string; sizeBytes: number; displayName: string }
+  | { ok: false; error: string; code: "empty" | "too_large" | "type_not_allowed" | "type_mismatch" | "extension_mismatch" };
+
+/**
+ * Validate an upload from its bytes plus what the browser claimed.
+ * The claim can only narrow; it can never make a disallowed file acceptable.
+ */
+export function checkEvidenceFile(input: { bytes: Uint8Array; declaredType?: string; fileName?: string }): FileCheck {
+  const { bytes } = input;
+  if (!bytes || bytes.length === 0) return { ok: false, code: "empty", error: "That file is empty." };
+  if (bytes.length > MAX_EVIDENCE_BYTES) return { ok: false, code: "too_large", error: "File must be 10 MB or smaller." };
+
+  const sniffed = sniffEvidenceType(bytes);
+  if (!sniffed) return { ok: false, code: "type_not_allowed", error: "Upload a PDF, PNG, JPEG or WebP file." };
+
+  const declared = (input.declaredType ?? "").toLowerCase().trim();
+  if (declared && declared !== sniffed && !(declared === "image/jpg" && sniffed === "image/jpeg")) {
+    return { ok: false, code: "type_mismatch", error: "The file's contents do not match its type." };
+  }
+
+  const extRaw = (input.fileName ?? "").toLowerCase().match(/\.([a-z0-9]{1,5})$/)?.[1];
+  if (extRaw && EXT_ALIASES[extRaw] && EXT_ALIASES[extRaw] !== sniffed) {
+    return { ok: false, code: "extension_mismatch", error: "The file's name does not match its contents." };
+  }
+  if (extRaw && !EXT_ALIASES[extRaw]) {
+    return { ok: false, code: "extension_mismatch", error: "Upload a PDF, PNG, JPEG or WebP file." };
+  }
+
+  return { ok: true, mime: sniffed, ext: EXT[sniffed], sizeBytes: bytes.length, displayName: safeDisplayName(input.fileName ?? "") };
+}
+
+const SAFE_ID = /^[A-Za-z0-9_-]{1,80}$/;
+
+/** Where the object lives. Built only from server-issued ids and the sniffed type. */
+export function evidenceObjectKey(parts: { orgId?: string | null; clientId: string; evidenceId: string; ext: string }): string {
+  const org = parts.orgId ?? "no-org";
+  for (const [k, v] of Object.entries({ org, clientId: parts.clientId, evidenceId: parts.evidenceId, ext: parts.ext })) {
+    if (!SAFE_ID.test(v)) throw new Error(`Unsafe ${k} for an evidence path.`);
+  }
+  return `${org}/${parts.clientId}/${parts.evidenceId}.${parts.ext}`;
+}

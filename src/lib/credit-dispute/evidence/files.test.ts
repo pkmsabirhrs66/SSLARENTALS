@@ -1,0 +1,144 @@
+import { describe, expect, it } from "vitest";
+import { MAX_EVIDENCE_BYTES, checkEvidenceFile, evidenceObjectKey, safeDisplayName, sniffEvidenceType } from "./files";
+
+/** C2-06 — evidence files are judged by their bytes, not by what the browser says. */
+
+const bytes = (...v: number[]) => new Uint8Array(v);
+const PDF = new Uint8Array([...new TextEncoder().encode("%PDF-1.7\n"), 1, 2, 3]);
+const PNG = bytes(0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13);
+const JPG = bytes(0xff, 0xd8, 0xff, 0xe0, 0, 16);
+const WEBP = new Uint8Array([...new TextEncoder().encode("RIFF"), 0, 0, 0, 0, ...new TextEncoder().encode("WEBPVP8 ")]);
+const HTML = new TextEncoder().encode("<html><script>alert(1)</script></html>");
+const SVG = new TextEncoder().encode('<svg xmlns="http://www.w3.org/2000/svg" onload="alert(1)"/>');
+const EXE = bytes(0x4d, 0x5a, 0x90, 0x00); // MZ
+const ZIP = bytes(0x50, 0x4b, 0x03, 0x04); // also .docx
+
+describe("type comes from the bytes", () => {
+  it.each([
+    ["PDF", PDF, "application/pdf"],
+    ["PNG", PNG, "image/png"],
+    ["JPEG", JPG, "image/jpeg"],
+    ["WebP", WEBP, "image/webp"],
+  ])("recognises %s", (_n, b, mime) => {
+    expect(sniffEvidenceType(b)).toBe(mime);
+  });
+
+  it.each([
+    ["HTML", HTML],
+    ["SVG", SVG],
+    ["Windows executable", EXE],
+    ["ZIP / Office document", ZIP],
+  ])("refuses %s outright", (_n, b) => {
+    const r = checkEvidenceFile({ bytes: b, declaredType: "application/pdf", fileName: "statement.pdf" });
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(["type_not_allowed", "type_mismatch"]).toContain(r.code);
+  });
+});
+
+describe("the browser's claims can only narrow, never widen", () => {
+  it("refuses an executable renamed to .pdf with a PDF MIME type", () => {
+    const r = checkEvidenceFile({ bytes: EXE, declaredType: "application/pdf", fileName: "bank.pdf" });
+    expect(r).toMatchObject({ ok: false, code: "type_not_allowed" });
+  });
+
+  it("refuses a real PNG declared as a PDF", () => {
+    expect(checkEvidenceFile({ bytes: PNG, declaredType: "application/pdf" })).toMatchObject({ ok: false, code: "type_mismatch" });
+  });
+
+  it("refuses a real PDF named .png", () => {
+    expect(checkEvidenceFile({ bytes: PDF, declaredType: "application/pdf", fileName: "x.png" })).toMatchObject({ ok: false, code: "extension_mismatch" });
+  });
+
+  it("refuses an allowed file with a disallowed extension", () => {
+    expect(checkEvidenceFile({ bytes: PDF, fileName: "x.pdf.exe" })).toMatchObject({ ok: false, code: "extension_mismatch" });
+  });
+
+  it("accepts a real PDF with no declared type", () => {
+    expect(checkEvidenceFile({ bytes: PDF, fileName: "statement.pdf" })).toMatchObject({ ok: true, mime: "application/pdf", ext: "pdf" });
+  });
+});
+
+describe("size", () => {
+  it("refuses an empty file", () => {
+    expect(checkEvidenceFile({ bytes: new Uint8Array(0) })).toMatchObject({ ok: false, code: "empty" });
+  });
+
+  it("refuses a file over the limit", () => {
+    const big = new Uint8Array(MAX_EVIDENCE_BYTES + 1);
+    big.set(PDF);
+    expect(checkEvidenceFile({ bytes: big })).toMatchObject({ ok: false, code: "too_large" });
+  });
+
+  it("accepts a file exactly at the limit", () => {
+    const edge = new Uint8Array(MAX_EVIDENCE_BYTES);
+    edge.set(PDF);
+    expect(checkEvidenceFile({ bytes: edge }).ok).toBe(true);
+  });
+});
+
+describe("C3-019 adversarial files", () => {
+  const ELF = bytes(0x7f, 0x45, 0x4c, 0x46, 2, 1, 1); // Linux executable
+  const MACHO = bytes(0xcf, 0xfa, 0xed, 0xfe); // macOS executable
+  const SCRIPT = new TextEncoder().encode("#!/bin/sh\nrm -rf /\n");
+  const HTML_THEN_PDF = new TextEncoder().encode("<html><script>alert(1)</script></html>%PDF-1.7");
+  const BOM_HTML = new Uint8Array([0xef, 0xbb, 0xbf, ...new TextEncoder().encode("<svg onload=alert(1)>")]);
+
+  it.each([
+    ["Linux ELF executable", ELF],
+    ["macOS Mach-O executable", MACHO],
+    ["shell script", SCRIPT],
+    ["HTML that only later mentions %PDF-", HTML_THEN_PDF],
+    ["SVG behind a UTF-8 BOM", BOM_HTML],
+  ])("refuses %s whatever it claims to be", (_n, b) => {
+    for (const [declaredType, fileName] of [["application/pdf", "statement.pdf"], ["image/png", "photo.png"], ["", ""]]) {
+      expect(checkEvidenceFile({ bytes: b, declaredType, fileName }).ok).toBe(false);
+    }
+  });
+
+  it.each([
+    ["PNG signature cut short", bytes(0x89, 0x50, 0x4e, 0x47)],
+    ["JPEG with only two marker bytes", bytes(0xff, 0xd8)],
+    ["RIFF header that is not WebP", new Uint8Array([...new TextEncoder().encode("RIFF"), 0, 0, 0, 0, ...new TextEncoder().encode("WAVE")])],
+    ["RIFF header truncated before the form type", new TextEncoder().encode("RIFF\0\0\0")],
+    ["'%PDF' without the dash", new TextEncoder().encode("%PDF1.7")],
+  ])("refuses a malformed image/PDF header: %s", (_n, b) => {
+    expect(checkEvidenceFile({ bytes: b }).ok).toBe(false);
+  });
+
+  it("display names cannot smuggle direction overrides, zero-width or control characters", () => {
+    const rtl = `invoice${String.fromCharCode(0x202e)}fdp.exe`;
+    const zw = `bank${String.fromCharCode(0x200b)}statement.pdf`;
+    const ctl = `a${String.fromCharCode(7, 8, 27)}b.pdf`;
+    for (const name of [rtl, zw, ctl]) {
+      const out = safeDisplayName(name);
+      expect(out).toMatch(/^[a-zA-Z0-9._ -]+$/);
+    }
+    expect(safeDisplayName(rtl)).not.toContain(String.fromCharCode(0x202e));
+  });
+
+  it("the stored object name never carries the display name, even a hostile one", () => {
+    const r = checkEvidenceFile({ bytes: PDF, fileName: "../../other-client/evil.pdf" });
+    expect(r.ok).toBe(true);
+    if (!r.ok) return;
+    const key = evidenceObjectKey({ orgId: "org-1", clientId: "client-1", evidenceId: "evid-1", ext: r.ext });
+    expect(key).toBe("org-1/client-1/evid-1.pdf");
+  });
+});
+
+describe("names and paths", () => {
+  it("strips directories, control characters and odd symbols from the display name", () => {
+    expect(safeDisplayName(`..\\..\\Windows\\sys32${String.fromCharCode(0, 31)}<evil>.pdf`)).toBe("sys32_evil_.pdf");
+    expect(safeDisplayName("../../etc/passwd")).toBe("passwd");
+    expect(safeDisplayName("")).toBe("document");
+  });
+
+  it("builds the object key only from server ids and the sniffed extension", () => {
+    expect(evidenceObjectKey({ orgId: null, clientId: "client-1", evidenceId: "evid-abc", ext: "pdf" })).toBe("no-org/client-1/evid-abc.pdf");
+  });
+
+  it("refuses any path part that could climb or escape", () => {
+    for (const bad of ["../x", "a/b", "a\\b", "", "x".repeat(81)]) {
+      expect(() => evidenceObjectKey({ clientId: bad, evidenceId: "e1", ext: "pdf" })).toThrow(/Unsafe/);
+    }
+  });
+});

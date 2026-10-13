@@ -1,0 +1,48 @@
+# LiteLLM router — local models PRIMARY, one legit cloud key as OPTIONAL overflow.
+# This is the legit "many models behind one endpoint" — NOT a pool of free keys.
+# Run with: bash scripts/tmmt brain router   (→ scripts/brain-router.sh)
+# Then point agents/app at:  http://<brain-tailnet-ip>:4000/v1/chat/completions
+#
+# Names agents/POCKET_BRAIN_MODEL ask for: "code" (agents) and "chat" (Pocket).
+model_list:
+  # ── LOCAL, FREE, PRIVATE (does the volume) ──────────────────────────────
+  - model_name: code
+    litellm_params:
+      model: ollama/qwen2.5-coder:14b
+      api_base: http://127.0.0.1:11434
+  - model_name: chat
+    litellm_params:
+      model: ollama/qwen2.5:14b
+      api_base: http://127.0.0.1:11434
+
+  # ── OPTIONAL OVERFLOW — the COST LADDER (all OFF by default) ──────────────
+  # Local (above) does the volume for free. Only reach for cloud when local is
+  # busy/insufficient, and CHEAPEST-FIRST so a chat never drains credits on
+  # routine work. One legitimate key from a real account — never key rotation.
+  # See docs/EMPLOYEE-FLEET.md for the full doctrine.
+  #
+  # TIER 2 — CHEAP CLOUD overflow (uncomment to enable): Haiku, pennies/call.
+  # - model_name: chat
+  #   litellm_params:
+  #     model: anthropic/claude-haiku-4-5
+  #     api_key: os.environ/ANTHROPIC_API_KEY
+  # - model_name: code
+  #   litellm_params:
+  #     model: anthropic/claude-haiku-4-5
+  #     api_key: os.environ/ANTHROPIC_API_KEY
+  #
+  # TIER 3 — BIG cloud, ON DEMAND ONLY (separate model_name so it is never the
+  # default fall-through; ask for "big" explicitly for a task that earns it):
+  # - model_name: big
+  #   litellm_params:
+  #     model: anthropic/claude-sonnet-5
+  #     api_key: os.environ/ANTHROPIC_API_KEY
+
+router_settings:
+  routing_strategy: simple-shuffle   # spread across entries with the same model_name
+  num_retries: 1                     # local first; fall through to overflow on failure
+  timeout: 120
+
+litellm_settings:
+  drop_params: true                  # tolerate client params a local model doesn't take
+  # set_verbose: false

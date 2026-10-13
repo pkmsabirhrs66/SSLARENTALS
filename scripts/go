@@ -1,0 +1,129 @@
+#!/usr/bin/env bash
+# go — the ONE command. Updates everything and boots the whole base in unison.
+# Self-sufficient: finds the repo, learns its own remote, self-heals, and installs
+# a permanent `unison` shortcut so next time you just type one word.
+set -uo pipefail
+BRANCH="${TMMT_BRANCH:-master}"
+
+locate() {
+  git rev-parse --show-toplevel 2>/dev/null && return
+  local d
+  for d in "$HOME/Projects/TMMT" "$HOME/projects/TMMT" "$HOME/TMMT" \
+           "$HOME/Documents/TMMT" "$HOME/Desktop/TMMT"; do
+    [ -d "$d/.git" ] && { printf '%s' "$d"; return; }
+  done
+  d="$(find "$HOME" -maxdepth 4 -type d -name .git -path '*/TMMT/.git' 2>/dev/null | head -1)"
+  [ -n "$d" ] && dirname "$d"
+}
+
+R="$(locate)"
+if [ -z "${R:-}" ]; then
+  R="$HOME/TMMT"
+  echo "› cloning into $R"
+  git clone "${TMMT_REPO:-https://github.com/AIXMOS537/TMMT.git}" "$R" \
+    || { echo "✗ clone failed — set TMMT_REPO to your repo URL and re-run"; exit 1; }
+fi
+cd "$R" || exit 1
+echo "› repo: $R"
+
+# DARK kill-switch: nothing boots while blacked out.
+if [ -f "$R/.swarm/DARK" ]; then
+  echo "⛔ DARK — boot blocked. Lift with the boss word: bash scripts/godark lift"; exit 1
+fi
+
+# Update (never blocked by local edits, never fatal when offline).
+git stash push -u -m "auto $(date -u +%FT%TZ)" >/dev/null 2>&1 || true
+# Self-heal the network: if the remote is unreachable, try bringing Tailscale up,
+# then retry the pull a few times before falling back to on-disk code.
+if ! git ls-remote origin >/dev/null 2>&1; then
+  command -v tailscale >/dev/null 2>&1 && tailscale up </dev/null >/dev/null 2>&1 || true
+fi
+_pulled=""
+for _i in 1 2 3; do
+  if git fetch origin "$BRANCH" >/dev/null 2>&1 || git fetch origin >/dev/null 2>&1; then
+    git checkout "$BRANCH" >/dev/null 2>&1 || true
+    git pull origin "$BRANCH" >/dev/null 2>&1 && { _pulled=1; break; }
+  fi
+  sleep 2
+done
+[ -n "$_pulled" ] || echo "! offline/unreachable — booting on-disk code"
+
+# Self-heal: make tools runnable + install the secret-guard hooks.
+chmod +x "$R"/scripts/go "$R"/scripts/tmmt "$R"/scripts/hailmary \
+         "$R"/scripts/mesh/*.sh "$R"/TMMT-GO.command 2>/dev/null || true
+git config core.hooksPath scripts/hooks 2>/dev/null || true
+
+# Role: owner gets the full kit; operators stay fenced (charter: least-privilege).
+ROLE="${SWARM_ROLE:-}"; [ -z "$ROLE" ] && [ -f "$R/.swarm/role" ] && ROLE="$(tr -d '[:space:]' < "$R/.swarm/role")"
+[ -z "$ROLE" ] && ROLE=operator
+
+# Install permanent one-word shortcuts so you never type a path again.
+# Idempotent: rewrite the block between guards every run (handles path changes).
+install_words() {
+  local rc="$1" tmp; tmp="$(mktemp)"
+  [ -e "$rc" ] && grep -v 'TMMT_WORDS' "$rc" > "$tmp" 2>/dev/null || true
+  {
+    echo "# TMMT_WORDS (auto-managed by scripts/go — one word does the thing)"
+    echo "alias menu='bash \"$R/scripts/menu\"'        # TMMT_WORDS"
+    echo "alias compass='bash \"$R/scripts/compass\"'          # TMMT_WORDS"
+    echo "alias whoami='bash \"$R/scripts/whoami-tmmt\"'       # TMMT_WORDS"
+    echo "alias watchtower='bash \"$R/scripts/watchtower\"'    # TMMT_WORDS"
+    echo "alias health='bash \"$R/scripts/health.sh\"'         # TMMT_WORDS"
+    echo "alias map='bash \"$R/scripts/mesh-map.sh\"'          # TMMT_WORDS"
+    echo "alias garage='bash \"$R/scripts/garage\"'           # TMMT_WORDS ← OVERHAUL configurator"
+    [ -x "$R/scripts/overhaul-deploy.sh" ] && echo "alias overhaul='bash \"$R/scripts/overhaul-deploy.sh\"' # TMMT_WORDS"
+    echo "alias secure='bash \"$R/scripts/launch-check.sh\"'   # TMMT_WORDS"
+    echo "alias enforce='bash \"$R/scripts/enforce\"'          # TMMT_WORDS ← cut unpaid"
+    echo "alias dark='bash \"$R/scripts/godark\"'              # TMMT_WORDS"
+    echo "alias light='bash \"$R/scripts/godark\" lift'        # TMMT_WORDS"
+    echo "alias base='bash \"$R/scripts/go\"'          # TMMT_WORDS"
+    if [ "$ROLE" = "owner" ]; then
+      echo "alias booyah='bash \"$R/scripts/go\"'         # TMMT_WORDS  ← THE start word"
+      echo "alias unison='bash \"$R/scripts/go\"'         # TMMT_WORDS"
+      echo "alias wake='bash \"$R/scripts/traptop-wake.sh\" wake'  # TMMT_WORDS ← traptop activation"
+      echo "alias traptop='bash \"$R/scripts/traptop-wake.sh\" status' # TMMT_WORDS"
+      echo "alias seal='bash \"$R/scripts/traptop-seal.sh\"'   # TMMT_WORDS ← seal before ship"
+      echo "alias hailmary='$HOME/.local/bin/hailmary'         # TMMT_WORDS ← operative CLI"
+      echo "alias onboard='bash \"$R/scripts/aixmos\" onboard'   # TMMT_WORDS"
+      echo "alias aixmos='bash \"$R/scripts/aixmos\" roster'     # TMMT_WORDS"
+      echo "alias fatherbox='bash \"$R/scripts/fatherbox\"'      # TMMT_WORDS"
+      echo "alias motherbox='bash \"$R/scripts/motherbox\"'      # TMMT_WORDS"
+      echo "alias workstation='bash \"$R/scripts/workstation\"'  # TMMT_WORDS"
+      echo "alias vertical='bash \"$R/scripts/new-vertical.sh\"' # TMMT_WORDS"
+      echo "alias map='bash \"$R/scripts/mesh-map.sh\"'          # TMMT_WORDS"
+    echo "alias garage='bash \"$R/scripts/garage\"'           # TMMT_WORDS ← OVERHAUL configurator"
+    [ -x "$R/scripts/overhaul-deploy.sh" ] && echo "alias overhaul='bash \"$R/scripts/overhaul-deploy.sh\"' # TMMT_WORDS"
+      echo "alias secure='bash \"$R/scripts/launch-check.sh\"'   # TMMT_WORDS"
+      echo "alias golive='bash \"$R/scripts/golive.sh\"'         # TMMT_WORDS"
+      echo "alias deal='bash \"$R/scripts/new-deal.sh\"'         # TMMT_WORDS"
+      echo "alias vault='bash \"$R/tools/project-x-hailmary/master/vault.sh\"' # TMMT_WORDS"
+      echo "alias member='bash \"$R/scripts/member\"'             # TMMT_WORDS"
+      echo "alias ceo='bash \"$R/scripts/ceo\"'                   # TMMT_WORDS"
+      echo "alias send-pack='bash \"$R/scripts/send-pack\"'       # TMMT_WORDS ← welcome packs"
+      echo "alias engineer='bash \"$R/scripts/engineer\"'         # TMMT_WORDS ← run operators' machines"
+      echo "alias collect='bash \"$R/scripts/collect\"'           # TMMT_WORDS"
+      echo "alias intake='bash \"$R/scripts/intake\"'             # TMMT_WORDS"
+      echo "alias invite='bash \"$R/scripts/invite\"'             # TMMT_WORDS ← message to send people"
+      echo "alias operator='bash \"$R/scripts/onboard-op\"'       # TMMT_WORDS ← onboard an operator, one shot"
+      echo "alias new-operator='bash \"$R/scripts/new-operator\"' # TMMT_WORDS ← stamp a protected operator"
+    else
+      # operator: work + sync + reach the owner; compass for well-being. No owner agents.
+      echo "alias work='bash \"$R/scripts/tmmt\" go 2'          # TMMT_WORDS"
+      echo "alias sync='bash \"$R/scripts/tmmt\" sync'          # TMMT_WORDS"
+      echo "alias who='bash \"$R/scripts/tmmt\" who'            # TMMT_WORDS"
+      echo "alias sos='bash \"$R/scripts/tmmt\" help'           # TMMT_WORDS"
+      echo "alias update='bash \"$R/scripts/go\"'               # TMMT_WORDS"
+      echo "alias brief='bash \"$R/scripts/moe-brief\"'         # TMMT_WORDS"
+      echo "alias hot='bash \"$R/scripts/moe-hot\"'             # TMMT_WORDS"
+      echo "alias 'moe-brief'='bash \"$R/scripts/moe-brief\"'   # TMMT_WORDS"
+      echo "alias 'moe-hot'='bash \"$R/scripts/moe-hot\"'       # TMMT_WORDS"
+    fi
+  } >> "$tmp"
+  mv "$tmp" "$rc"
+}
+for rc in "$HOME/.zshrc" "$HOME/.bashrc"; do install_words "$rc"; done
+bash "$R/scripts/lib/install-oneshot-bin.sh" 2>/dev/null || true
+echo "› role: $ROLE — one-word commands ready (open a new terminal, type: menu)"
+
+bash "$R/scripts/menu" || true
+if [ "$ROLE" = "owner" ]; then exec bash "$R/scripts/tmmt" unison; else exec bash "$R/scripts/tmmt" sync; fi

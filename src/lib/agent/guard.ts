@@ -1,0 +1,118 @@
+/**
+ * License live-check + spend cap enforcement on every B3 entry point.
+ * Spec A integration: queries organization_licenses for active state and kill_command.
+ * "TMMT and AIXMOS always safe" — see docs/superpowers/specs/2026-06-09-spec-b3-ai-sales-agent-design.md §12
+ */
+import { createServiceRoleClient } from '@/lib/supabase-service'
+
+export class LicenseDisabledError extends Error {
+  constructor(public organizationId: string, public killCommand: string | null) {
+    super(`License disabled for organization=${organizationId} kill=${killCommand ?? 'none'}`)
+    this.name = 'LicenseDisabledError'
+  }
+}
+
+export class OperationalKillError extends Error {
+  constructor() {
+    super('B3 operational kill-switch engaged (B3_KILL_SWITCH=1)')
+    this.name = 'OperationalKillError'
+  }
+}
+
+export class LlmCapExceededError extends Error {
+  constructor(public organizationId: string, public spentUsd: number, public capUsd: number) {
+    super(`LLM daily cap exceeded for organization=${organizationId} spent=$${spentUsd.toFixed(4)} cap=$${capUsd.toFixed(2)}`)
+    this.name = 'LlmCapExceededError'
+  }
+}
+
+/**
+ * The two house organizations. Spec B3 §12 says "TMMT and AIXMOS always safe",
+ * and until now that was a promise in a comment with nothing enforcing it.
+ *
+ * It matters: TMMT RENTALS' own licence row is `active: false` with no key
+ * issued, and the check below throws on an inactive licence. The moment public
+ * lead capture starts flowing through /api/leads/webhook, TMMT would have been
+ * rejecting its own leads. Nothing has broken yet only because that route is
+ * barely used - 8 leads in the last 30 days, none of them through it.
+ *
+ * Licensing exists to gate paying operators. Applying it to the house orgs is a
+ * self-inflicted outage, not a safety feature.
+ */
+const HOUSE_ORGS = new Set([
+  '8e651b25-e7c8-4356-af64-1716a82053b0', // TMMT RENTALS
+  'aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa', // AIXMOS
+])
+
+export function isHouseOrg(organizationId: string): boolean {
+  return HOUSE_ORGS.has(organizationId)
+}
+
+/** True when the B3 operational kill switch (B3_KILL_SWITCH=1) is engaged. */
+export function isOperationalKillEngaged(): boolean {
+  return process.env.B3_KILL_SWITCH === '1'
+}
+
+export async function guardOrganization(organizationId: string): Promise<void> {
+  // The operational kill switch still applies to everyone, house included. It
+  // is the deliberate "stop everything" lever and must not have exceptions.
+  if (isOperationalKillEngaged()) throw new OperationalKillError()
+
+  // Licensing gates customers, never ourselves.
+  if (isHouseOrg(organizationId)) return
+
+  const db = createServiceRoleClient()
+  const { data } = await db
+    .from('organization_licenses')
+    .select('active, kill_command')
+    .eq('organization_id', organizationId)
+    .single()
+
+  if (!data || !data.active || data.kill_command === 'wipe') {
+    throw new LicenseDisabledError(organizationId, data?.kill_command ?? null)
+  }
+}
+
+/**
+ * Sum today's audit_events cost_usd entries for this org and refuse if at/over cap.
+ * Today is defined as UTC midnight → now, filtered on audit_events.ts (the row
+ * timestamp; the table has no created_at, see audit-events-columns.ts).
+ * The audit emitter writes cost_usd into payload on every `agent.llm_call` event.
+ *
+ * This used to filter on `created_at`. PostgREST answered 42703 on every
+ * call, the error branch below failed closed, and every org with a cap (default
+ * 50 USD) was refused on every inbound SMS and voice summary.
+ */
+export async function assertLlmCapNotExceeded(
+  organizationId: string,
+  capUsd: number,
+): Promise<{ spentUsd: number; capUsd: number; remainingUsd: number }> {
+  if (!Number.isFinite(capUsd) || capUsd <= 0) {
+    return { spentUsd: 0, capUsd, remainingUsd: capUsd }
+  }
+
+  const since = new Date()
+  since.setUTCHours(0, 0, 0, 0)
+
+  const db = createServiceRoleClient()
+  const { data, error } = await db
+    .from('audit_events')
+    .select('payload')
+    .eq('organization_id', organizationId)
+    .eq('action', 'agent.llm_call')
+    .gte('ts', since.toISOString())
+
+  if (error) {
+    console.error('[guard.llm_cap] audit_events query failed; failing closed', error.message)
+    throw new LlmCapExceededError(organizationId, 0, capUsd)
+  }
+
+  const spentUsd = (data ?? []).reduce<number>((acc, row) => {
+    const raw = (row.payload as { cost_usd?: unknown } | null)?.cost_usd
+    const n = typeof raw === 'number' ? raw : Number(raw)
+    return acc + (Number.isFinite(n) && n > 0 ? n : 0)
+  }, 0)
+
+  if (spentUsd >= capUsd) throw new LlmCapExceededError(organizationId, spentUsd, capUsd)
+  return { spentUsd, capUsd, remainingUsd: capUsd - spentUsd }
+}

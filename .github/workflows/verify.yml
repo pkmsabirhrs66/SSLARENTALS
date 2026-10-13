@@ -1,0 +1,64 @@
+name: Verify (local-first gate)
+
+# The server-side backstop to the local gate (scripts/verify.sh): lint + unit
+# tests + production build on every PR and every push to master. Make this a
+# REQUIRED status check on master (branch protection) and broken code can never
+# land — so any deploy from master is inherently safe.
+#
+# No secrets needed: build/test/lint all run without .env (env is read lazily).
+
+on:
+  pull_request:
+  push:
+    branches: [master]
+
+# One run per ref; cancel stale runs so the latest commit is what's judged.
+concurrency:
+  group: verify-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    # The check name GitHub reports is this `name`, not the job id. Docs and the
+    # session-autopilot workflow refer to the required check as "verify", and a
+    # decorated name never matched it. Keep it exactly "verify".
+    name: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+      - name: Brand map in sync
+        run: npm run brand:check
+      - name: Lint
+        run: npm run lint
+      # `next build` type-checks only what it bundles, which excludes *.test.ts.
+      # A widened type can therefore break the test fixtures while lint, vitest
+      # and the build all stay green — that is exactly how the `restricted` flag
+      # from #181 reached master. tsc over the whole tsconfig is the only check
+      # that sees it, so it runs on its own here rather than being implied by
+      # the build step's old "(+ typecheck)" label.
+      - name: Typecheck (tsc, includes tests)
+        run: npx tsc --noEmit
+      - name: Unit tests
+        run: npm test
+      # Release-blocking regression guard for the profiles self-promote-to-admin
+      # hole (PR #249). Embedded Postgres 17 (PGlite) with production's helper
+      # bodies, policies and grants; every attack must fail with the migration.
+      - name: SQL security rehearsals (profiles privilege escalation)
+        run: |
+          npm ci --prefix scripts/tests/sql --no-audit --no-fund
+          node scripts/tests/sql/profiles-access-columns.rehearsal.mjs
+          node scripts/tests/sql/profiles-escalation-adversarial.rehearsal.mjs
+      - name: Production build
+        run: npm run build
+      # Credit Center (C1): who can read credit records and evidence, today and under
+      # the staged case foundation. Embedded Postgres 17 (PGlite), no secrets.
+      - name: SQL rehearsal (credit data isolation)
+        run: |
+          npm ci --prefix scripts/tests/sql --no-audit --no-fund
+          node scripts/tests/sql/credit-isolation.rehearsal.mjs
